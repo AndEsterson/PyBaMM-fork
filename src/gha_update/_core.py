@@ -85,12 +85,29 @@ def find_name_in_line(line: str) -> str | None:
     return "/".join(parts[:2])
 
 
-async def get_versions(names: Iterable[str]) -> dict[str, tuple[str, str]]:
-    tasks: dict[str, Task[Response]] = {}
+async def make_request(client: AsyncClient, url: str) -> Response:
+    while True:
+        response = await client.get(url)
+        if response.status_code == 403:
+            raise Exception(f"Github API rate limit reached, try setting the GITHUB_TOKEN environment variable \n {response.json()}")
+        elif response.status_code in {301, 302, 307}:
+            location = response.headers.get("location")
+            if not location:
+                raise Exception(f"Redirected response missing Location header for {url}")
+            url = location
+        else:
+            return response
 
-    async with AsyncClient(base_url="https://api.github.com") as c, TaskGroup() as tg:
+
+async def get_versions(names: Iterable[str]) -> dict[str, tuple[str, str]]:
+
+    tasks: dict[str, Task[Response]] = {}
+    headers: dict[str, str] = {}
+    if github_token := os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = github_token
+    async with AsyncClient(base_url="https://api.github.com", headers=headers) as c, TaskGroup() as tg:
         for name in names:
-            tasks[name] = tg.create_task(c.get(f"/repos/{name}/tags"))
+            tasks[name] = tg.create_task(make_request(c, f"/repos/{name}/tags"))
 
     out: dict[str, tuple[str, str]] = {}
 
