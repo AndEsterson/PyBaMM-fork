@@ -14,6 +14,9 @@ from typing import Any
 from httpx import AsyncClient
 from httpx import Response
 
+class GHRateLimitException(Exception):
+    """Raised when github hits an API rate limit"""
+
 Config = t.TypedDict(
     "Config",
     {
@@ -84,19 +87,43 @@ def find_name_in_line(line: str) -> str | None:
     # omit subdirectory
     return "/".join(parts[:2])
 
-
-async def get_versions(names: Iterable[str]) -> dict[str, tuple[str, str]]:
+async def make_requests(name_repo_pairs: list[dict[str, str]]) -> dict[str, Task[Response]]:
     tasks: dict[str, Task[Response]] = {}
+    headers: dict[str, str] = {}
+    if github_token := os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = github_token
+    async with AsyncClient(base_url="https://api.github.com", headers=headers) as c, TaskGroup() as tg:
+        for name_repo_pair in name_repo_pairs:
+            tg.create_task(c.get(f"/repos/{name_repo_pair["repo"]}/tags"))
+    return tasks
 
-    async with AsyncClient(base_url="https://api.github.com") as c, TaskGroup() as tg:
-        for name in names:
-            tasks[name] = tg.create_task(c.get(f"/repos/{name}/tags"))
-
+def resolve_responses(tasks: dict[str, Task[Response]]) -> tuple[dict[str,
+    tuple[str, str]], list[dict[str, str]]]:
     out: dict[str, tuple[str, str]] = {}
+    redirected_name_repo_pairs: list[dict[str, str]] = []
 
     for name, task in tasks.items():
-        out[name] = highest_version(task.result().json())
+        if task.result().status_code == 403:
+            raise(GHRateLimitException(task.result().json()))
+        #handle redirects
+        if task.result().status_code in [301, 302, 307]:
+            print(task.result().headers.get("location"))
+            redirected_name = task.result().headers.get("location")
+            redirected_name_repo_pairs.append({"name": name, "repo": redirected_name})
+        else:
+            out[name] = highest_version(task.result().json())
 
+    return out, redirected_name_repo_pairs
+
+async def get_versions(names: Iterable[str]) -> dict[str, tuple[str, str]]:
+    name_repo_pairs: list[dict[str, str]] = [{"name": n, "repo": n} for n in names]
+
+    tasks = make_requests(name_repo_pairs)
+    out, redirected_pairs = resolve_responses(tasks)
+    while redirected_pairs:
+        tasks = make_requests(redirected_pairs)
+        redirected_out, redirected_pairs = resolve_responses(tasks)
+        out.update(redirected_out)
     return out
 
 
